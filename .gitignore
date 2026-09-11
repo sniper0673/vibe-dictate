@@ -12,3 +12,6 @@ Cargo.lock
 
 # Per-host overrides for docker compose
 .env
+
+/credentials/
+/.local/

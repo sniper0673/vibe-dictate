@@ -18,6 +18,7 @@ const ID_ENABLED: &str = "vd:enabled";
 const ID_AUTOSTART: &str = "vd:autostart";
 const ID_OUT_CLIPBOARD: &str = "vd:out:clipboard";
 const ID_OUT_SENDINPUT: &str = "vd:out:sendinput";
+const ID_OUT_SMART: &str = "vd:out:smart";
 const ID_OUT_SEND_ENTER: &str = "vd:out:send_enter";
 const ID_OUT_INTERACTIVE: &str = "vd:out:interactive";
 const PREFIX_SEND_DELAY: &str = "vd:out:keydelay:";
@@ -446,8 +447,16 @@ fn build_menu(cfg: &Config) -> Result<Menu> {
         match cfg.output.mode {
             OutputMode::Clipboard => "Output mode: Clipboard",
             OutputMode::Sendinput => "Output mode: SendInput",
+            OutputMode::Smart => "Output mode: Smart",
         },
         true,
+    );
+    let mode_smart = CheckMenuItem::with_id(
+        MenuId::new(ID_OUT_SMART),
+        "Smart (browser / terminal aware)",
+        true,
+        cfg.output.mode == OutputMode::Smart,
+        None,
     );
     let mode_clipboard = CheckMenuItem::with_id(
         MenuId::new(ID_OUT_CLIPBOARD),
@@ -463,6 +472,7 @@ fn build_menu(cfg: &Config) -> Result<Menu> {
         cfg.output.mode == OutputMode::Sendinput,
         None,
     );
+    output_sub.append(&mode_smart)?;
     output_sub.append(&mode_clipboard)?;
     output_sub.append(&mode_sendinput)?;
     menu.append(&output_sub)?;
@@ -472,7 +482,7 @@ fn build_menu(cfg: &Config) -> Result<Menu> {
     // keep the menu layout stable on mode switches, but can't be clicked).
     // Label carries the current value so the user doesn't have to open
     // the submenu to check.
-    let sendinput_active = cfg.output.mode == OutputMode::Sendinput;
+    let sendinput_active = matches!(cfg.output.mode, OutputMode::Sendinput | OutputMode::Smart);
     let delay_sub = Submenu::new(
         format!("SendInput char delay: {} ms", cfg.output.send_key_delay_ms),
         sendinput_active,
@@ -656,6 +666,12 @@ pub fn handle_menu_event(
         }
         autostart::set_enabled(new_val)?;
         log::info!("Autostart set to {}", new_val);
+        outcome.menu_dirty = true;
+    } else if id == ID_OUT_SMART {
+        let mut c = cfg.lock().unwrap();
+        c.output.mode = OutputMode::Smart;
+        c.save()?;
+        log::info!("Output mode: Smart");
         outcome.menu_dirty = true;
     } else if id == ID_OUT_CLIPBOARD {
         let mut c = cfg.lock().unwrap();

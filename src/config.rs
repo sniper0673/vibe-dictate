@@ -296,6 +296,7 @@ impl Default for OutputConfig {
 pub enum OutputMode {
     Clipboard,
     Sendinput,
+    Smart,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

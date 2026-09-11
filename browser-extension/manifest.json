@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Vibe Dictate Browser Bridge",
+  "version": "0.1.0",
+  "description": "Routes Vibe Dictate transcriptions into the active browser tab without switching tabs.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqy5s4eSfeLcvv3hKhsqhGjPKh2WWNihSD4xvMTro3tKsO5/q5UEYRi689WAZGfujOrESd0JziIMoG6d0gVLGvk3mC4DCGjAPzFmTgsaTzBNpTZ8UgZY+sJzCUMuR2bbEDOfnK1VZh1AjHssLG74oa2g1nqowVvs7zggAm/J5tZ+I2DdDCzycOXxbqcihllFipFcOU8E6LJlpLh6a/C9DVOgYfe5QyEjMBLg2sMoW8SBV6Esb2d/TzsgmFaRy9kmASDCKmLVuyw7iFk+6cxhQ3uAuH9K+12UmKukeREdT5NHMyQKpCEUFD9UJvP2uhEpNJ8+ikFbzzdMsTFqD1nSLxQIDAQAB",
+  "permissions": ["nativeMessaging", "scripting", "tabs", "alarms"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [{
+    "matches": ["http://*/*", "https://*/*"],
+    "js": ["content-script.js"],
+    "run_at": "document_idle"
+  }],
+  "action": {
+    "default_title": "Vibe Dictate Browser Bridge"
+  }
+}

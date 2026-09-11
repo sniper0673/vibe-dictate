@@ -9,6 +9,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_V,
 };
 
+pub fn clipboard_copy(text: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new().context("clipboard open")?;
+    clipboard.set_text(text.to_string()).context("set clipboard")?;
+    Ok(())
+}
+
 pub fn clipboard_paste(text: &str) -> Result<()> {
     let mut clipboard = Clipboard::new().context("clipboard open")?;
     let previous = clipboard.get_text().ok();
@@ -119,14 +125,31 @@ fn send_ctrl_v() -> Result<()> {
 /// SendInput and clipboard-paste modes — the clipboard path can't carry a
 /// reliable newline, so we always fall back to a real keystroke here.
 pub fn send_enter() -> Result<()> {
-    let inputs = [
-        make_vk_input(VK_RETURN, false),
-        make_vk_input(VK_RETURN, true),
-    ];
-    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if (n as usize) < inputs.len() {
+    send_enter_with_hold(0)
+}
+
+/// Send Return with an optional physical key-down hold. A short hold is
+/// useful for busy Chromium targets that can occasionally miss an
+/// instantaneous down+up pair while processing DOM updates.
+pub fn send_enter_with_hold(hold_ms: u64) -> Result<()> {
+    let down = [make_vk_input(VK_RETURN, false)];
+    let cbsize = std::mem::size_of::<INPUT>() as i32;
+    let n_down = unsafe { SendInput(&down, cbsize) };
+    if n_down != 1 {
         let err = unsafe { GetLastError() };
-        log::warn!("SendInput VK_RETURN dropped ({}/{} events, err {:?})", n, inputs.len(), err);
+        log::warn!("SendInput VK_RETURN down dropped ({}/1, err {:?})", n_down, err);
+        return Ok(());
+    }
+    if hold_ms > 0 {
+        thread::sleep(Duration::from_millis(hold_ms));
+    }
+    let up = [make_vk_input(VK_RETURN, true)];
+    let n_up = unsafe { SendInput(&up, cbsize) };
+    if n_up != 1 {
+        let err = unsafe { GetLastError() };
+        log::warn!("SendInput VK_RETURN up dropped ({}/1, err {:?})", n_up, err);
+    } else {
+        log::info!("SendInput VK_RETURN delivered (hold={}ms)", hold_ms);
     }
     Ok(())
 }

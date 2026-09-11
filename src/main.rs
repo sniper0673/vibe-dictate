@@ -53,8 +53,11 @@ use tray_icon::menu::MenuEvent;
 
 mod audio;
 mod autostart;
+mod browser_bridge;
+mod browser_native;
 mod config;
 mod openai;
+mod output_router;
 mod hotkey_capture;
 mod injector;
 mod keystroke;
@@ -126,6 +129,14 @@ impl BindingManager {
 }
 
 fn main() -> Result<()> {
+    let native_host_exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|name| name.to_string_lossy().to_ascii_lowercase()))
+        .map(|name| name.contains("native-host"))
+        .unwrap_or(false);
+    if native_host_exe || std::env::args().any(|arg| arg == "--native-messaging-host") {
+        return browser_native::run_native_host();
+    }
     init_logger();
     log::info!("vibe-dictate v{} starting", env!("CARGO_PKG_VERSION"));
     if let Ok(p) = Config::log_path() {
@@ -153,6 +164,10 @@ fn main() -> Result<()> {
         let _ = quit_proxy.send_event(AppEvent::Quit);
     })
     .context("singleton acquire")?;
+
+    // Start the localhost-only browser bridge only after singleton ownership is fixed.
+    // A replacement instance must not lose the listener by racing the previous process.
+    let browser_bridge = browser_bridge::BrowserBridge::start();
 
     // Tray icon + menu
     let tray_state = tray::build(&cfg.lock().unwrap())?;
@@ -250,6 +265,7 @@ fn main() -> Result<()> {
     let connection_ok_loop = connection_ok.clone();
     let last_status_loop = last_status.clone();
     let vad_speech_active_loop = vad_speech_active.clone();
+    let browser_bridge_loop = browser_bridge.clone();
 
     // Keep tray + binding + mouse-hook state alive for the event loop.
     let tray_keep_alive = tray_state;
@@ -474,6 +490,7 @@ fn main() -> Result<()> {
                                 let conn_clone = connection_ok_loop.clone();
                                 let flash_err_clone = flash_error_until_loop.clone();
                                 let note_clone = last_error_note_loop.clone();
+                                let browser_clone = browser_bridge_loop.clone();
                                 in_flight_clone.store(true, Ordering::SeqCst);
                                 thread::spawn(move || {
                                     let res = send_and_inject(
@@ -483,6 +500,7 @@ fn main() -> Result<()> {
                                         conn_clone,
                                         flash_err_clone,
                                         note_clone,
+                                        browser_clone,
                                     );
                                     in_flight_clone.store(false, Ordering::SeqCst);
                                     if let Err(e) = res {
@@ -672,6 +690,7 @@ fn main() -> Result<()> {
                                             let conn_clone = connection_ok_loop.clone();
                                             let flash_err_clone = flash_error_until_loop.clone();
                                             let note_clone = last_error_note_loop.clone();
+                                            let browser_clone = browser_bridge_loop.clone();
                                             in_flight_clone.store(true, Ordering::SeqCst);
                                             thread::spawn(move || {
                                                 let res = send_and_inject(
@@ -681,6 +700,7 @@ fn main() -> Result<()> {
                                                     conn_clone,
                                                     flash_err_clone,
                                                     note_clone,
+                                                    browser_clone,
                                                 );
                                                 in_flight_clone.store(false, Ordering::SeqCst);
                                                 if let Err(e) = res {
@@ -1064,6 +1084,7 @@ fn send_and_inject(
     connection_ok: Arc<AtomicBool>,
     flash_error_until: Arc<Mutex<Option<Instant>>>,
     last_error_note: Arc<Mutex<Option<(Instant, String)>>>,
+    browser_bridge: browser_bridge::BrowserBridge,
 ) -> Result<()> {
     let (server_cfg, stt_cfg, output_cfg) = {
         let c = cfg.lock().unwrap();
@@ -1161,6 +1182,7 @@ fn send_and_inject(
     }
     log::info!("Transcription ({} chars): {}", out.len(), out);
 
+    let mut send_enter_after_delivery = output_cfg.send_enter;
     match output_cfg.mode {
         OutputMode::Clipboard => injector::clipboard_paste(&out)?,
         OutputMode::Sendinput => injector::send_input_text(
@@ -1168,8 +1190,54 @@ fn send_and_inject(
             output_cfg.send_key_delay_ms,
             output_cfg.send_key_down_delay_ms,
         )?,
+        OutputMode::Smart => {
+            let target = output_router::detect_foreground_target();
+            log::info!(
+                "Smart output target: process={} kind={:?}",
+                target.process_name,
+                target.kind,
+            );
+            match target.kind {
+                output_router::TargetKind::Terminal => injector::send_input_text(
+                    &out,
+                    output_cfg.send_key_delay_ms,
+                    output_cfg.send_key_down_delay_ms,
+                )?,
+                output_router::TargetKind::Browser => {
+                    match browser_bridge.deliver_text(&out) {
+                        Ok(delivery) => {
+                            log::info!(
+                                "Browser delivery succeeded: target={} score={}",
+                                delivery.target_kind,
+                                delivery.score,
+                            );
+                            if output_cfg.send_enter {
+                                // Let React/contenteditable settle, then hold Return briefly so a busy
+                                // Chromium renderer is less likely to miss an instantaneous key event.
+                                thread::sleep(Duration::from_millis(150));
+                                injector::send_enter_with_hold(30)?;
+                                log::info!("Browser submit Enter sent (settle=150ms, hold=30ms)");
+                                send_enter_after_delivery = false;
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("Browser delivery unavailable: {}", error);
+                            injector::clipboard_copy(&out)?;
+                            report_pipeline_error(
+                                "Browser input target unavailable; transcription copied",
+                                false,
+                                &flash_error_until,
+                                &last_error_note,
+                            );
+                            send_enter_after_delivery = false;
+                        }
+                    }
+                }
+                output_router::TargetKind::Generic => injector::clipboard_paste(&out)?,
+            }
+        }
     }
-    if output_cfg.send_enter {
+    if send_enter_after_delivery {
         injector::send_enter()?;
     }
     // Successful end-to-end — clear any stale error note so the tooltip
