@@ -61,6 +61,7 @@ mod output_router;
 mod hotkey_capture;
 mod injector;
 mod keystroke;
+mod local_control;
 mod mouse_hook;
 mod singleton;
 mod text_input;
@@ -168,6 +169,7 @@ fn main() -> Result<()> {
     // Start the localhost-only browser bridge only after singleton ownership is fixed.
     // A replacement instance must not lose the listener by racing the previous process.
     let browser_bridge = browser_bridge::BrowserBridge::start();
+    let control_rx = local_control::start();
 
     // Tray icon + menu
     let tray_state = tray::build(&cfg.lock().unwrap())?;
@@ -440,23 +442,44 @@ fn main() -> Result<()> {
                 // Collapse keyboard + mouse events into a single stream of
                 // Press/Release actions so the downstream recording logic
                 // doesn't care which input device triggered the user.
-                #[derive(Copy, Clone)]
                 enum PushAction {
                     Press,
-                    Release,
+                    Release {
+                        submit_override: Option<bool>,
+                        respond_to: Option<
+                            std::sync::mpsc::Sender<local_control::ControlResponse>,
+                        >,
+                    },
                 }
                 let mut actions: Vec<PushAction> = Vec::new();
                 while let Ok(hk_evt) = GlobalHotKeyEvent::receiver().try_recv() {
                     actions.push(match hk_evt.state {
                         HotKeyState::Pressed => PushAction::Press,
-                        HotKeyState::Released => PushAction::Release,
+                        HotKeyState::Released => PushAction::Release {
+                            submit_override: None,
+                            respond_to: None,
+                        },
                     });
                 }
                 while let Ok(m_evt) = mouse_rx.try_recv() {
                     actions.push(match m_evt {
                         mouse_hook::MouseEvent::Pressed => PushAction::Press,
-                        mouse_hook::MouseEvent::Released => PushAction::Release,
+                        mouse_hook::MouseEvent::Released => PushAction::Release {
+                            submit_override: None,
+                            respond_to: None,
+                        },
                     });
+                }
+
+                while let Ok(request) = control_rx.try_recv() {
+                    match request.command {
+                        local_control::ControlCommand::StopDictation { submit } => {
+                            actions.push(PushAction::Release {
+                                submit_override: Some(submit),
+                                respond_to: Some(request.respond_to),
+                            });
+                        }
+                    }
                 }
 
                 // Drain any pending VAD events. Utterances get routed into
@@ -501,6 +524,7 @@ fn main() -> Result<()> {
                                         flash_err_clone,
                                         note_clone,
                                         browser_clone,
+                                        None,
                                     );
                                     in_flight_clone.store(false, Ordering::SeqCst);
                                     if let Err(e) = res {
@@ -657,7 +681,7 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
-                        PushAction::Release => {
+                        PushAction::Release { submit_override, respond_to } => {
                             let rec = recorder_loop.lock().unwrap().take();
                             let started = press_time_loop.lock().unwrap().take();
                             // Remember this release so a follow-up quick
@@ -674,6 +698,11 @@ fn main() -> Result<()> {
                                         duration.as_millis()
                                     );
                                     drop(r);
+                                    if let Some(tx) = respond_to {
+                                        let _ = tx.send(local_control::ControlResponse::error(
+                                            "recording_too_short",
+                                        ));
+                                    }
                                 } else {
                                     // cpal::Stream is !Send, encode WAV on this thread
                                     // before handing bytes off to the network worker.
@@ -692,6 +721,9 @@ fn main() -> Result<()> {
                                             let note_clone = last_error_note_loop.clone();
                                             let browser_clone = browser_bridge_loop.clone();
                                             in_flight_clone.store(true, Ordering::SeqCst);
+                                            if let Some(tx) = respond_to {
+                                                let _ = tx.send(local_control::ControlResponse::ok("processing"));
+                                            }
                                             thread::spawn(move || {
                                                 let res = send_and_inject(
                                                     wav,
@@ -701,6 +733,7 @@ fn main() -> Result<()> {
                                                     flash_err_clone,
                                                     note_clone,
                                                     browser_clone,
+                                                    submit_override,
                                                 );
                                                 in_flight_clone.store(false, Ordering::SeqCst);
                                                 if let Err(e) = res {
@@ -712,9 +745,18 @@ fn main() -> Result<()> {
                                         }
                                         Err(e) => {
                                             log::error!("WAV encode failed: {e:#}");
+                                            if let Some(tx) = respond_to {
+                                                let _ = tx.send(local_control::ControlResponse::error(
+                                                    "wav_encode_failed",
+                                                ));
+                                            }
                                         }
                                     }
                                 }
+                            } else if let Some(tx) = respond_to {
+                                let _ = tx.send(local_control::ControlResponse::error(
+                                    "no_active_recording",
+                                ));
                             }
                         }
                     }
@@ -1077,6 +1119,10 @@ fn apply_text_input(field: tray::TextField, value: &str, cfg: &Arc<Mutex<Config>
     }
 }
 
+fn effective_send_enter(configured: bool, submit_override: Option<bool>) -> bool {
+    submit_override.unwrap_or(configured)
+}
+
 fn send_and_inject(
     wav: Vec<u8>,
     cfg: Arc<Mutex<Config>>,
@@ -1085,6 +1131,7 @@ fn send_and_inject(
     flash_error_until: Arc<Mutex<Option<Instant>>>,
     last_error_note: Arc<Mutex<Option<(Instant, String)>>>,
     browser_bridge: browser_bridge::BrowserBridge,
+    submit_override: Option<bool>,
 ) -> Result<()> {
     let (server_cfg, stt_cfg, output_cfg) = {
         let c = cfg.lock().unwrap();
@@ -1182,7 +1229,8 @@ fn send_and_inject(
     }
     log::info!("Transcription ({} chars): {}", out.len(), out);
 
-    let mut send_enter_after_delivery = output_cfg.send_enter;
+    let mut send_enter_after_delivery =
+        effective_send_enter(output_cfg.send_enter, submit_override);
     match output_cfg.mode {
         OutputMode::Clipboard => injector::clipboard_paste(&out)?,
         OutputMode::Sendinput => injector::send_input_text(
@@ -1211,7 +1259,7 @@ fn send_and_inject(
                                 delivery.target_kind,
                                 delivery.score,
                             );
-                            if output_cfg.send_enter {
+                            if send_enter_after_delivery {
                                 // Let React/contenteditable settle, then hold Return briefly so a busy
                                 // Chromium renderer is less likely to miss an instantaneous key event.
                                 thread::sleep(Duration::from_millis(150));
@@ -1439,4 +1487,13 @@ fn parse_code(name: &str) -> Option<Code> {
         }
         _ => return None,
     })
+}
+#[cfg(test)]
+mod main_tests {
+    #[test]
+    fn per_utterance_submit_override_wins() {
+        assert!(super::effective_send_enter(true, None));
+        assert!(!super::effective_send_enter(true, Some(false)));
+        assert!(super::effective_send_enter(false, Some(true)));
+    }
 }

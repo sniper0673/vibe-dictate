@@ -447,6 +447,17 @@ Right-click the tray icon to get:
 
 ---
 
+### Local dictation control
+
+Vibe Dictate exposes a loopback-only control socket on `127.0.0.1:47832` for bounded local integrations such as Physical Input Bridge. Requests are one JSON object per line. The first contract is:
+
+```json
+{"command":"dictation.stop","submit":false}
+```
+
+`submit=false` finishes the current push-to-talk recording, runs the normal transcription/output pipeline, and suppresses Enter for that utterance only. The persistent `output.send_enter` setting is unchanged. `submit=true` explicitly requests submission for that utterance. Unsupported commands are rejected; the control surface does not execute arbitrary commands.
+
+
 ## Output modes
 
 Two ways to deliver the transcription to the focused window:
