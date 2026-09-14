@@ -6,9 +6,12 @@ Smart Output keeps the existing recording and STT pipeline unchanged and routes 
 
 - Browser (`chrome.exe`, `msedge.exe`, `brave.exe`, `vivaldi.exe`): deliver through the browser extension into the currently active HTTP(S) tab.
 - Terminal (`WindowsTerminal.exe`, `powershell.exe`, `pwsh.exe`, `cmd.exe`, `conhost.exe`): type Unicode text directly with `SendInput`; clipboard paste is not used.
+- Claude desktop (`claude.exe`): when the foreground Claude window is large enough for the fullscreen layout, focus the bottom-center composer before clipboard delivery. The cursor position is restored immediately after the focus click.
 - Other applications: retain the upstream clipboard + Ctrl+V behavior.
 
 The target is detected after transcription completes, so the user may switch windows or Chrome tabs while speaking. Smart Output never activates a remembered browser tab.
+
+Claude desktop targeting is intentionally layout-bounded. If the foreground app changes, the Claude window is not maximized, or the window is too small for the known fullscreen composer layout, the transcription is copied without clicking or submitting an uncertain location.
 
 ## Browser bridge
 

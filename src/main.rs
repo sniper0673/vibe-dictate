@@ -1251,6 +1251,28 @@ fn send_and_inject(
                     output_cfg.send_key_delay_ms,
                     output_cfg.send_key_down_delay_ms,
                 )?,
+                output_router::TargetKind::Claude => {
+                    match output_router::focus_claude_composer() {
+                        Ok(()) => {
+                            injector::clipboard_paste(&out)?;
+                            if send_enter_after_delivery {
+                                injector::send_enter_with_hold(30)?;
+                            }
+                            log::info!("Claude desktop delivery succeeded");
+                        }
+                        Err(error) => {
+                            log::warn!("Claude desktop input unavailable: {error}");
+                            injector::clipboard_copy(&out)?;
+                            report_pipeline_error(
+                                "Claude input target unavailable; transcription copied",
+                                false,
+                                &flash_error_until,
+                                &last_error_note,
+                            );
+                        }
+                    }
+                    send_enter_after_delivery = false;
+                }
                 output_router::TargetKind::Browser => {
                     match browser_bridge.deliver_text(&out) {
                         Ok(delivery) => {
