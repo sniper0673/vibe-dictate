@@ -6,12 +6,15 @@ Smart Output keeps the existing recording and STT pipeline unchanged and routes 
 
 - Browser (`chrome.exe`, `msedge.exe`, `brave.exe`, `vivaldi.exe`): deliver through the browser extension into the currently active HTTP(S) tab.
 - Terminal (`WindowsTerminal.exe`, `powershell.exe`, `pwsh.exe`, `cmd.exe`, `conhost.exe`): type Unicode text directly with `SendInput`; clipboard paste is not used.
-- Claude desktop (`claude.exe`): when the foreground Claude window is large enough for the fullscreen layout, focus the bottom-center composer before clipboard delivery. The cursor position is restored immediately after the focus click.
-- Other applications: retain the upstream clipboard + Ctrl+V behavior.
+- Claude desktop (`claude.exe`): restore the utterance-start window, then try to focus the known composer before clipboard delivery (cursor position is restored immediately after the focus click). If the focus probe is unavailable — foreground changed, window not maximized, too small — deliver at whatever already has focus instead of aborting; a submit is still attempted.
+- OpenCode desktop (`OpenCode.exe`): restore the utterance-start window and deliver at whatever already has focus, same as an unrecognized app. An earlier `Ctrl+L` composer-focus probe was removed — it proved unreliable against real OpenCode window-activation timing and sidebar/Review-pane state, and silently "succeeded" even when it hadn't actually moved focus.
+- Other applications: restore the utterance-start top-level window and retain the upstream clipboard + Ctrl+V behavior.
 
-The target is detected after transcription completes, so the user may switch windows or Chrome tabs while speaking. Smart Output never activates a remembered browser tab.
+For PTT, the top-level delivery target is captured when the record button is pressed; for VAD, it is captured at `SpeechStart`. The user may move focus while speaking or while STT is processing: delivery temporarily returns to the captured window, then restores the newer foreground window afterwards. If the original window no longer exists or cannot be safely reactivated, delivery fails closed to clipboard copy instead of typing into the wrong place. Browser delivery still targets the active HTTP(S) tab inside the captured browser window, so changing tabs within that same browser window remains a separate edge case.
 
-Claude desktop targeting is intentionally layout-bounded. If the foreground app changes, the Claude window is not maximized, or the window is too small for the known fullscreen composer layout, the transcription is copied without clicking or submitting an uncertain location.
+When no submit is requested (e.g. the local-control "finish without submit" command), Smart Output never runs any composer hunt or focus probe for any app, recognized or not — there is nothing for a hunt to protect since Enter is never sent, and probing (mouse move, shortcut injection) would only risk disturbing whatever the owner already has focused. Delivery in that case is always a plain paste (or, for a terminal, direct `SendInput` typing) at the current focus.
+
+Browser delivery keeps a stricter fail-closed contract than desktop apps: if the extension cannot identify a confident input candidate on the page, the transcription is copied to the clipboard without pasting or submitting, because a browser page can hold many candidate controls and a blind paste risks landing in the wrong one. Claude/OpenCode desktop delivery does not carry this same page-full-of-controls risk, so their fallback is a plain in-place paste instead.
 
 ## Browser bridge
 

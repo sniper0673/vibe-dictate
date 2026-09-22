@@ -214,6 +214,10 @@ fn main() -> Result<()> {
     // Recording state
     let recorder: Arc<Mutex<Option<audio::Recorder>>> = Arc::new(Mutex::new(None));
     let press_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    // Smart Output locks delivery to the window that owned focus when the utterance began.
+    // The snapshot is consumed on release/utterance completion and validated again before delivery.
+    let delivery_target: Arc<Mutex<Option<output_router::ForegroundTarget>>> =
+        Arc::new(Mutex::new(None));
     // Double-tap detection state. `last_press_at` tracks the previous Pressed
     // timestamp (regardless of whether it was a single tap or the start of a
     // tap-tap). `cancel_flag` is set the moment a double-tap is detected and
@@ -257,6 +261,7 @@ fn main() -> Result<()> {
     let cfg_loop = cfg.clone();
     let recorder_loop = recorder.clone();
     let press_time_loop = press_time.clone();
+    let delivery_target_loop = delivery_target.clone();
     let last_press_at_loop = last_press_at.clone();
     let last_release_at_loop = last_release_at.clone();
     let cancel_flag_loop = cancel_flag.clone();
@@ -496,6 +501,12 @@ fn main() -> Result<()> {
                             }
                             audio::VadSessionEvent::SpeechStart => {
                                 vad_speech_active_loop.store(true, Ordering::SeqCst);
+                                let target = output_router::detect_foreground_target();
+                                log::info!(
+                                    "Delivery target captured at VAD speech start: process={} kind={:?} hwnd={}",
+                                    target.process_name, target.kind, target.hwnd
+                                );
+                                *delivery_target_loop.lock().unwrap() = Some(target);
                             }
                             audio::VadSessionEvent::Utterance { wav, duration_ms } => {
                                 vad_speech_active_loop.store(false, Ordering::SeqCst);
@@ -514,6 +525,7 @@ fn main() -> Result<()> {
                                 let flash_err_clone = flash_error_until_loop.clone();
                                 let note_clone = last_error_note_loop.clone();
                                 let browser_clone = browser_bridge_loop.clone();
+                                let captured_target = delivery_target_loop.lock().unwrap().take();
                                 in_flight_clone.store(true, Ordering::SeqCst);
                                 thread::spawn(move || {
                                     let res = send_and_inject(
@@ -525,6 +537,7 @@ fn main() -> Result<()> {
                                         note_clone,
                                         browser_clone,
                                         None,
+                                        captured_target,
                                     );
                                     in_flight_clone.store(false, Ordering::SeqCst);
                                     if let Err(e) = res {
@@ -631,6 +644,7 @@ fn main() -> Result<()> {
                                 if slot.is_none() {
                                     cancel_flag_loop.store(false, Ordering::SeqCst);
                                     *flash_until_loop.lock().unwrap() = None;
+                                    let target = output_router::detect_foreground_target();
                                     let audio_cfg = cfg_loop.lock().unwrap().audio.clone();
                                     match audio::Recorder::start(&audio_cfg) {
                                         Ok(r) => {
@@ -638,6 +652,11 @@ fn main() -> Result<()> {
                                             *slot = Some(r);
                                             *press_time_loop.lock().unwrap() =
                                                 Some(Instant::now());
+                                            log::info!(
+                                                "Delivery target captured at recording press: process={} kind={:?} hwnd={}",
+                                                target.process_name, target.kind, target.hwnd
+                                            );
+                                            *delivery_target_loop.lock().unwrap() = Some(target);
                                         }
                                         Err(e) => {
                                             log::error!("Failed to start recording: {e:#}")
@@ -654,6 +673,7 @@ fn main() -> Result<()> {
                                     log::info!("Double-tap cancel: recording aborted");
                                 }
                                 *press_time_loop.lock().unwrap() = None;
+                                *delivery_target_loop.lock().unwrap() = None;
                                 *flash_until_loop.lock().unwrap() =
                                     Some(Instant::now() + CANCEL_FLASH_DURATION);
                             } else {
@@ -666,6 +686,7 @@ fn main() -> Result<()> {
                                     // shortly after a cancel.
                                     cancel_flag_loop.store(false, Ordering::SeqCst);
                                     *flash_until_loop.lock().unwrap() = None;
+                                    let target = output_router::detect_foreground_target();
                                     let audio_cfg = cfg_loop.lock().unwrap().audio.clone();
                                     match audio::Recorder::start(&audio_cfg) {
                                         Ok(r) => {
@@ -673,6 +694,11 @@ fn main() -> Result<()> {
                                             *slot = Some(r);
                                             *press_time_loop.lock().unwrap() =
                                                 Some(Instant::now());
+                                            log::info!(
+                                                "Delivery target captured at recording press: process={} kind={:?} hwnd={}",
+                                                target.process_name, target.kind, target.hwnd
+                                            );
+                                            *delivery_target_loop.lock().unwrap() = Some(target);
                                         }
                                         Err(e) => {
                                             log::error!("Failed to start recording: {e:#}")
@@ -684,6 +710,7 @@ fn main() -> Result<()> {
                         PushAction::Release { submit_override, respond_to } => {
                             let rec = recorder_loop.lock().unwrap().take();
                             let started = press_time_loop.lock().unwrap().take();
+                            let captured_target = delivery_target_loop.lock().unwrap().take();
                             // Remember this release so a follow-up quick
                             // press within PROCESSING_CANCEL_WINDOW can
                             // cancel the in-flight transcription.
@@ -734,6 +761,7 @@ fn main() -> Result<()> {
                                                     note_clone,
                                                     browser_clone,
                                                     submit_override,
+                                                    captured_target,
                                                 );
                                                 in_flight_clone.store(false, Ordering::SeqCst);
                                                 if let Err(e) = res {
@@ -1132,6 +1160,7 @@ fn send_and_inject(
     last_error_note: Arc<Mutex<Option<(Instant, String)>>>,
     browser_bridge: browser_bridge::BrowserBridge,
     submit_override: Option<bool>,
+    captured_target: Option<output_router::ForegroundTarget>,
 ) -> Result<()> {
     let (server_cfg, stt_cfg, output_cfg) = {
         let c = cfg.lock().unwrap();
@@ -1231,6 +1260,29 @@ fn send_and_inject(
 
     let mut send_enter_after_delivery =
         effective_send_enter(output_cfg.send_enter, submit_override);
+
+    // If this utterance began while a particular window owned focus, deliver back
+    // to that exact top-level window. Keep a guard alive through paste + optional
+    // Enter so the owner's newer foreground window is restored only afterwards.
+    let _captured_focus_guard = if let Some(target) = captured_target.as_ref() {
+        match output_router::activate_captured_target(target) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                log::warn!("Original delivery target unavailable: {error}");
+                injector::clipboard_copy(&out)?;
+                report_pipeline_error(
+                    "Original input target unavailable; transcription copied",
+                    false,
+                    &flash_error_until,
+                    &last_error_note,
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     match output_cfg.mode {
         OutputMode::Clipboard => injector::clipboard_paste(&out)?,
         OutputMode::Sendinput => injector::send_input_text(
@@ -1239,71 +1291,93 @@ fn send_and_inject(
             output_cfg.send_key_down_delay_ms,
         )?,
         OutputMode::Smart => {
-            let target = output_router::detect_foreground_target();
+            let was_captured = captured_target.is_some();
+            let target = captured_target.unwrap_or_else(output_router::detect_foreground_target);
             log::info!(
-                "Smart output target: process={} kind={:?}",
+                "Smart output target: process={} kind={:?} hwnd={} source={}",
                 target.process_name,
                 target.kind,
+                target.hwnd,
+                if was_captured { "utterance-start" } else { "delivery-time-fallback" },
             );
-            match target.kind {
-                output_router::TargetKind::Terminal => injector::send_input_text(
-                    &out,
-                    output_cfg.send_key_delay_ms,
-                    output_cfg.send_key_down_delay_ms,
-                )?,
-                output_router::TargetKind::Claude => {
-                    match output_router::focus_claude_composer() {
-                        Ok(()) => {
-                            injector::clipboard_paste(&out)?;
-                            if send_enter_after_delivery {
-                                injector::send_enter_with_hold(30)?;
-                            }
-                            log::info!("Claude desktop delivery succeeded");
-                        }
-                        Err(error) => {
-                            log::warn!("Claude desktop input unavailable: {error}");
-                            injector::clipboard_copy(&out)?;
-                            report_pipeline_error(
-                                "Claude input target unavailable; transcription copied",
-                                false,
-                                &flash_error_until,
-                                &last_error_note,
-                            );
-                        }
-                    }
-                    send_enter_after_delivery = false;
+            if !send_enter_after_delivery {
+                // No submit was requested (e.g. F8 finish-without-submit). There is
+                // nothing for a composer hunt to protect — Enter is never sent — so
+                // never move the mouse or steal focus with a shortcut probe. Deliver
+                // at whatever already has focus and let the owner navigate manually,
+                // for every app including ones we don't specially recognize.
+                match target.kind {
+                    output_router::TargetKind::Terminal => injector::send_input_text(
+                        &out,
+                        output_cfg.send_key_delay_ms,
+                        output_cfg.send_key_down_delay_ms,
+                    )?,
+                    _ => injector::clipboard_paste(&out)?,
                 }
-                output_router::TargetKind::Browser => {
-                    match browser_bridge.deliver_text(&out) {
-                        Ok(delivery) => {
-                            log::info!(
-                                "Browser delivery succeeded: target={} score={}",
-                                delivery.target_kind,
-                                delivery.score,
+            } else {
+                match target.kind {
+                    output_router::TargetKind::Terminal => injector::send_input_text(
+                        &out,
+                        output_cfg.send_key_delay_ms,
+                        output_cfg.send_key_down_delay_ms,
+                    )?,
+                    output_router::TargetKind::Claude => {
+                        if let Err(error) = output_router::focus_claude_composer() {
+                            log::warn!(
+                                "Claude composer focus unavailable, delivering at current focus: {error}"
                             );
-                            if send_enter_after_delivery {
+                        } else {
+                            log::info!("Claude desktop composer focus succeeded");
+                        }
+                        injector::clipboard_paste(&out)?;
+                        injector::send_enter_with_hold(30)?;
+                        send_enter_after_delivery = false;
+                    }
+                    output_router::TargetKind::OpenCode => {
+                        // The Ctrl+L composer-focus probe proved unreliable in practice
+                        // (OpenCode window activation timing, sidebar/Review pane state).
+                        // Deliver in place like Generic instead of gambling Enter on a
+                        // focus change the owner did not make themselves.
+                        injector::clipboard_paste(&out)?;
+                        injector::send_enter_with_hold(30)?;
+                        send_enter_after_delivery = false;
+                    }
+                    output_router::TargetKind::Browser => {                        match browser_bridge.deliver_text(&out) {
+                            Ok(delivery) => {
+                                log::info!(
+                                    "Browser delivery succeeded: target={} score={}",
+                                    delivery.target_kind,
+                                    delivery.score,
+                                );
                                 // Let React/contenteditable settle, then hold Return briefly so a busy
                                 // Chromium renderer is less likely to miss an instantaneous key event.
-                                thread::sleep(Duration::from_millis(150));
+                                thread::sleep(Duration::from_millis(100));
                                 injector::send_enter_with_hold(30)?;
-                                log::info!("Browser submit Enter sent (settle=150ms, hold=30ms)");
+                                log::info!("Browser submit Enter sent (settle=100ms, hold=30ms)");
+                                send_enter_after_delivery = false;
+                            }
+                            Err(error) => {
+                                // Unlike Claude/OpenCode desktop windows, a browser page can
+                                // hold many candidate controls; pasting blind risks landing in
+                                // the wrong one. Keep this path fail-closed to clipboard copy.
+                                log::warn!("Browser delivery unavailable: {}", error);
+                                injector::clipboard_copy(&out)?;
+                                report_pipeline_error(
+                                    "Browser input target unavailable; transcription copied",
+                                    false,
+                                    &flash_error_until,
+                                    &last_error_note,
+                                );
                                 send_enter_after_delivery = false;
                             }
                         }
-                        Err(error) => {
-                            log::warn!("Browser delivery unavailable: {}", error);
-                            injector::clipboard_copy(&out)?;
-                            report_pipeline_error(
-                                "Browser input target unavailable; transcription copied",
-                                false,
-                                &flash_error_until,
-                                &last_error_note,
-                            );
-                            send_enter_after_delivery = false;
-                        }
                     }
+                    output_router::TargetKind::Generic => injector::clipboard_paste(&out)?,
                 }
-                output_router::TargetKind::Generic => injector::clipboard_paste(&out)?,
+                if send_enter_after_delivery {
+                    injector::send_enter()?;
+                    send_enter_after_delivery = false;
+                }
             }
         }
     }

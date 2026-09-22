@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::thread;
 use std::time::Duration;
 use windows::core::PWSTR;
@@ -12,8 +13,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, IsZoomed,
-    SetCursorPos,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsZoomed, SetCursorPos, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub enum TargetKind {
     Browser,
     Terminal,
     Claude,
+    OpenCode,
     Generic,
 }
 
@@ -28,12 +30,79 @@ pub enum TargetKind {
 pub struct ForegroundTarget {
     pub kind: TargetKind,
     pub process_name: String,
+    /// Top-level foreground HWND captured when the utterance starts. Stored as an
+    /// integer so the snapshot can safely cross the transcription worker thread.
+    pub hwnd: isize,
 }
 
 pub fn detect_foreground_target() -> ForegroundTarget {
-    let process_name = foreground_process_name().unwrap_or_else(|| "unknown".to_string());
+    let hwnd = unsafe { GetForegroundWindow() };
+    let process_name = process_name_from_hwnd(hwnd).unwrap_or_else(|| "unknown".to_string());
     let kind = classify_process_name(&process_name);
-    ForegroundTarget { kind, process_name }
+    ForegroundTarget {
+        kind,
+        process_name,
+        hwnd: hwnd.0 as isize,
+    }
+}
+
+/// Temporarily reactivate the window captured at utterance start. The returned
+/// guard restores whatever window the owner was using at delivery time.
+pub struct ForegroundRestoreGuard {
+    previous_hwnd: isize,
+    target_hwnd: isize,
+}
+
+impl Drop for ForegroundRestoreGuard {
+    fn drop(&mut self) {
+        if self.previous_hwnd == 0 || self.previous_hwnd == self.target_hwnd {
+            return;
+        }
+        let hwnd = HWND(self.previous_hwnd as *mut c_void);
+        if unsafe { IsWindow(hwnd) }.as_bool() {
+            let _ = unsafe { SetForegroundWindow(hwnd) };
+        }
+    }
+}
+
+pub fn activate_captured_target(target: &ForegroundTarget) -> Result<ForegroundRestoreGuard> {
+    if target.hwnd == 0 {
+        return Err(anyhow!("captured target has no window handle"));
+    }
+    let hwnd = HWND(target.hwnd as *mut c_void);
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+        return Err(anyhow!("captured target window no longer exists"));
+    }
+    let current_name = process_name_from_hwnd(hwnd)
+        .ok_or_else(|| anyhow!("captured target process is unavailable"))?;
+    if !current_name.eq_ignore_ascii_case(&target.process_name) {
+        return Err(anyhow!(
+            "captured target changed process: expected {}, got {}",
+            target.process_name,
+            current_name
+        ));
+    }
+
+    let previous = unsafe { GetForegroundWindow() };
+    if previous != hwnd {
+        if unsafe { IsIconic(hwnd) }.as_bool() {
+            let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        }
+        if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+            return Err(anyhow!("could not reactivate captured target window"));
+        }
+        thread::sleep(Duration::from_millis(45));
+        if unsafe { GetForegroundWindow() } != hwnd {
+            if !previous.0.is_null() && unsafe { IsWindow(previous) }.as_bool() {
+                let _ = unsafe { SetForegroundWindow(previous) };
+            }
+            return Err(anyhow!("captured target did not retain foreground focus"));
+        }
+    }
+    Ok(ForegroundRestoreGuard {
+        previous_hwnd: previous.0 as isize,
+        target_hwnd: target.hwnd,
+    })
 }
 pub fn classify_process_name(name: &str) -> TargetKind {
     let lower = name.to_ascii_lowercase();
@@ -43,6 +112,7 @@ pub fn classify_process_name(name: &str) -> TargetKind {
             TargetKind::Terminal
         }
         "claude.exe" => TargetKind::Claude,
+        "opencode.exe" => TargetKind::OpenCode,
         _ => TargetKind::Generic,
     }
 }
@@ -123,7 +193,10 @@ fn mouse_input(flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_F
 }
 
 fn foreground_process_name() -> Option<String> {
-    let hwnd: HWND = unsafe { GetForegroundWindow() };
+    process_name_from_hwnd(unsafe { GetForegroundWindow() })
+}
+
+fn process_name_from_hwnd(hwnd: HWND) -> Option<String> {
     if hwnd.0.is_null() {
         return None;
     }
@@ -170,6 +243,7 @@ mod tests {
         );
         assert_eq!(classify_process_name("pwsh.exe"), TargetKind::Terminal);
         assert_eq!(classify_process_name("claude.exe"), TargetKind::Claude);
+        assert_eq!(classify_process_name("OpenCode.exe"), TargetKind::OpenCode);
         assert_eq!(classify_process_name("notepad.exe"), TargetKind::Generic);
     }
 

@@ -1,23 +1,34 @@
 const HOST = 'com.brstk.vibe_dictate';
 let nativePort = null;
 let reconnectTimer = null;
+let profileFocused = false;
 
 function scheduleReconnect() {
-  if (reconnectTimer) return;
+  if (!profileFocused || reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectNative();
   }, 3000);
 }
 
+function disconnectNative() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  const port = nativePort;
+  nativePort = null;
+  try { port?.disconnect(); } catch {}
+}
+
 function connectNative() {
-  if (nativePort) return;
+  if (!profileFocused || nativePort) return;
   try {
     const port = chrome.runtime.connectNative(HOST);
     nativePort = port;
     port.onMessage.addListener(handleNativeMessage);
     port.onDisconnect.addListener(() => {
-      nativePort = null;
+      if (nativePort === port) nativePort = null;
       scheduleReconnect();
     });
   } catch {
@@ -26,13 +37,49 @@ function connectNative() {
   }
 }
 
+function setProfileFocused(focused) {
+  const next = Boolean(focused);
+  if (profileFocused === next) {
+    if (next) connectNative();
+    return;
+  }
+  profileFocused = next;
+  if (profileFocused) connectNative();
+  else disconnectNative();
+}
+
 async function getActiveHttpTab() {
-  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const tab = tabs[0];
+  const tabs = await chrome.tabs.query({ active: true });
+  const httpTabs = tabs.filter(tab => tab.id && /^https?:/i.test(tab.url || ''));
+
+  for (const tab of httpTabs) {
+    try {
+      const probe = await sendToPage(tab.id, { action: 'probe_focus' });
+      if (probe?.ok && probe.has_focus) return tab;
+    } catch {}
+  }
+
+  const fallback = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const tab = fallback[0];
   if (!tab?.id || !/^https?:/i.test(tab.url || '')) {
     throw new Error('unsupported_active_tab');
   }
   return tab;
+}
+
+async function refreshProfileFocus() {
+  const tabs = await chrome.tabs.query({ active: true });
+  for (const tab of tabs) {
+    if (!tab.id || !/^https?:/i.test(tab.url || '')) continue;
+    try {
+      const probe = await sendToPage(tab.id, { action: 'probe_focus' });
+      if (probe?.ok && probe.has_focus) {
+        setProfileFocused(true);
+        return;
+      }
+    } catch {}
+  }
+  setProfileFocused(false);
 }
 
 async function sendToPage(tabId, message) {
@@ -56,10 +103,20 @@ async function handleNativeMessage(message) {
   }
 }
 
-chrome.runtime.onInstalled.addListener(connectNative);
-chrome.runtime.onStartup.addListener(connectNative);
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.action === 'profile_focus') {
+    setProfileFocused(Boolean(message.focused));
+    sendResponse({ ok: true });
+    return false;
+  }
+});
+
+chrome.runtime.onInstalled.addListener(() => { void refreshProfileFocus(); });
+chrome.runtime.onStartup.addListener(() => { void refreshProfileFocus(); });
+chrome.windows.onFocusChanged.addListener(() => { void refreshProfileFocus(); });
+chrome.tabs.onActivated.addListener(() => { void refreshProfileFocus(); });
 chrome.alarms.onAlarm.addListener(alarm => {
-  if (alarm.name === 'vibe-native-reconnect' && !nativePort) connectNative();
+  if (alarm.name === 'vibe-native-reconnect') void refreshProfileFocus();
 });
 chrome.alarms.create('vibe-native-reconnect', { periodInMinutes: 0.5 });
-connectNative();
+void refreshProfileFocus();

@@ -109,8 +109,23 @@
     }
   }
 
+  function reportProfileFocus() {
+    try {
+      chrome.runtime.sendMessage({ action: 'profile_focus', focused: document.hasFocus() });
+    } catch {}
+  }
+
+  window.addEventListener('focus', reportProfileFocus, true);
+  window.addEventListener('blur', reportProfileFocus, true);
+  document.addEventListener('visibilitychange', reportProfileFocus, true);
+  reportProfileFocus();
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (!message || message.action !== 'deliver_text') return;
+    if (!message) return;
+    if (message.action === 'probe_focus') {
+      sendResponse({ ok: true, has_focus: document.hasFocus() });
+      return false;
+    }
+    if (message.action !== 'deliver_text') return;
     sendResponse(deliver(message.text));
     return false;
   });

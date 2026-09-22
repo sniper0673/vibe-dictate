@@ -20,8 +20,8 @@ pub fn clipboard_paste(text: &str) -> Result<()> {
     let previous = clipboard.get_text().ok();
     clipboard.set_text(text.to_string()).context("set clipboard")?;
     send_ctrl_v()?;
-    // Give the target app a moment to consume the clipboard before restoring
-    thread::sleep(Duration::from_millis(120));
+    // Give the target app a short moment to consume the clipboard before restoring
+    thread::sleep(Duration::from_millis(80));
     if let Some(prev) = previous {
         let _ = clipboard.set_text(prev);
     }
