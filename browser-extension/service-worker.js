@@ -28,6 +28,10 @@ function connectNative() {
     nativePort = port;
     port.onMessage.addListener(handleNativeMessage);
     port.onDisconnect.addListener(() => {
+      // Native-host disconnects are recoverable here. Reading lastError marks
+      // the callback error as handled so Chrome does not accumulate an
+      // "Unchecked runtime.lastError" extension error before reconnecting.
+      void chrome.runtime.lastError;
       if (nativePort === port) nativePort = null;
       scheduleReconnect();
     });
