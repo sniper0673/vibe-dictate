@@ -20,6 +20,12 @@ Built for Hungarian dictation but works in any of the 50+ languages
 VibeVoice-ASR supports. Multilingual by accident of the backend; Hungarian
 by intent of the author.
 
+## Current Smart Output snapshot — 2026-09-27
+
+Smart Output now captures the top-level delivery target when an utterance begins (PTT press or VAD speech start) and validates that target again before delivery. Browser targets use the Chrome/Edge Native Messaging bridge with fail-closed input selection; terminal targets use Unicode `SendInput`; Claude/OpenCode and other desktop targets follow the bounded desktop routing/fallback rules. If the original target cannot be safely restored, the transcription is preserved on the clipboard rather than typed into an uncertain window. Native-host disconnects are treated as recoverable and the browser bridge reconnects only for the focused browser profile.
+
+See [`docs/SMART_OUTPUT.md`](docs/SMART_OUTPUT.md) for the current routing, focus-restoration, browser confidence, and local bridge contract.
+
 ---
 
 ## Table of contents
